@@ -182,7 +182,7 @@ pub fn setupReleaseStep(
                 });
                 const archive = zip.addOutputFileArg(archive_name);
                 zip.addDirectoryArg(release_exe.getEmittedBin());
-                _ = zip.captureStdOut(.{});
+                _ = zip.captureStdOut();
 
                 release_step.dependOn(&b.addInstallFileWithDir(
                     archive,
@@ -205,7 +205,7 @@ pub fn setupReleaseStep(
 
                 tar.addDirectoryArg(release_exe.getEmittedBinDirectory());
                 tar.addArg("ziggy");
-                _ = tar.captureStdOut(.{});
+                _ = tar.captureStdOut();
 
                 release_step.dependOn(&b.addInstallFileWithDir(
                     archive,
@@ -254,7 +254,7 @@ pub fn setupReleaseStep(
         tar.addArg("-C");
         tar.addDirectoryArg(ziggy_wasm_lsp.getEmittedBinDirectory());
         tar.addArg("ziggy.wasm");
-        _ = tar.captureStdOut(.{});
+        _ = tar.captureStdOut();
         release_step.dependOn(&b.addInstallFileWithDir(
             archive,
             .{ .custom = "releases" },

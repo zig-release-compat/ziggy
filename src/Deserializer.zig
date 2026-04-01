@@ -48,6 +48,9 @@ pub const Meta = struct {
     /// name of the first missing field encountered (points at static memory),
     /// set to undefined otherwise.
     missing_field_name: []const u8,
+    /// On deserialization ERROR, when the error is `Unexpected`, optionally
+    /// contains description of the expected token.
+    expcted_token: ?[]const u8,
     /// On deserialization SUCCESS, when delimiter is not `.none`, set to
     /// undefined otherwise
     doc: struct {
@@ -160,6 +163,7 @@ pub const Error = error{
     DuplicateField,
     UnknownField,
     MissingField,
+    LengthMismatch,
 };
 
 /// Returns the next token, consuming it
@@ -175,8 +179,9 @@ pub fn peek(d: *const Deserializer) Token.Tag {
 
 /// Sets the right meta field and returns error.Unexpected, to be used when
 /// encountering an unexpected token in a custom deserialization function.
-pub fn unexpected(d: *const Deserializer, tok: Token) Error {
+pub fn unexpected(d: *const Deserializer, tok: Token, expected: ?[]const u8) Error {
     d.meta.error_loc = tok.loc;
+    d.meta.expcted_token = expected;
     return error.Unexpected;
 }
 
@@ -327,7 +332,7 @@ pub fn deserializeOne(d: *const Deserializer, T: type, first: Token, top_lvl: bo
         .bool => switch (first.tag) {
             .true => return true,
             .false => return false,
-            else => return d.unexpected(first),
+            else => return d.unexpected(first, "boolean value"),
         },
         .comptime_float, .float => switch (first.tag) {
             .integer, .float => {
@@ -336,7 +341,7 @@ pub fn deserializeOne(d: *const Deserializer, T: type, first: Token, top_lvl: bo
                     unreachable;
                 };
             },
-            else => return d.unexpected(first),
+            else => return d.unexpected(first, "float value"),
         },
         .comptime_int, .int => switch (first.tag) {
             .integer => {
@@ -347,7 +352,7 @@ pub fn deserializeOne(d: *const Deserializer, T: type, first: Token, top_lvl: bo
                     }
                 };
             },
-            else => return d.unexpected(first),
+            else => return d.unexpected(first, "integer value"),
         },
         .optional => |info| switch (first.tag) {
             .null => return null,
@@ -356,7 +361,7 @@ pub fn deserializeOne(d: *const Deserializer, T: type, first: Token, top_lvl: bo
         .@"enum" => switch (first.tag) {
             .identifier => return std.meta.stringToEnum(T, first.loc.slice(d.src)[1..]) orelse
                 d.unknownField(first),
-            else => return d.unexpected(first),
+            else => return d.unexpected(first, null),
         },
         .@"union" => |info| {
             if (@hasDecl(T, "ziggy_options") and
@@ -370,7 +375,7 @@ pub fn deserializeOne(d: *const Deserializer, T: type, first: Token, top_lvl: bo
                     const tag = first.loc.slice(d.src)[1..]; // skip '.'
                     inline for (info.fields) |f| {
                         if (std.mem.eql(u8, f.name, tag)) {
-                            if (f.type != void) return d.unexpected(first);
+                            if (f.type != void) return d.unexpected(first, null);
                             return @unionInit(T, f.name, {});
                         }
                     } else return d.unknownField(first);
@@ -400,18 +405,18 @@ pub fn deserializeOne(d: *const Deserializer, T: type, first: Token, top_lvl: bo
                             );
 
                             const tok = d.next();
-                            if (tok.tag != .rp) return d.unexpected(tok);
+                            if (tok.tag != .rp) return d.unexpected(tok, "\"(\"");
                             return value;
                         }
                     } else return d.unknownField(first);
                 },
-                else => return d.unexpected(first),
+                else => return d.unexpected(first, null),
             }
         },
-        .array, .vector => |info| {
+        .array => |info| {
             var arr: T = undefined;
 
-            if (first.tag != .lsb) return d.unexpected(first);
+            if (first.tag != .lsb) return d.unexpected(first, "\"[\"");
             if (arr.len == 0) {
                 const maybe_rsb = d.next();
                 return if (maybe_rsb.tag == .rsb) arr else d.lengthMismatch(maybe_rsb);
@@ -425,7 +430,7 @@ pub fn deserializeOne(d: *const Deserializer, T: type, first: Token, top_lvl: bo
 
                 elem.* = try d.deserializeOne(
                     info.child,
-                    d.next(),
+                    tok,
                     false,
                 );
 
@@ -434,11 +439,18 @@ pub fn deserializeOne(d: *const Deserializer, T: type, first: Token, top_lvl: bo
                         _ = d.next();
                         continue;
                     },
-                    .rsb => return if (idx == arr.len - 1) arr else d.lengthMismatch(next),
-                    else => return d.unexpected(d.next()),
+                    .rsb => return if (idx == arr.len - 1) arr else d.lengthMismatch(d.next()),
+                    else => return d.unexpected(d.next(), "\",\""),
                 }
             }
-            comptime unreachable;
+
+            const rsb = d.next();
+            if (rsb.tag != .rsb) return d.unexpected(rsb, "\"]\"");
+
+            return arr;
+        },
+        .vector => {
+            @compileError("TBD");
         },
         .@"struct" => |info| {
             if (@hasDecl(T, "ziggy_options") and
@@ -458,15 +470,15 @@ pub fn deserializeOne(d: *const Deserializer, T: type, first: Token, top_lvl: bo
                     if (top_lvl) {
                         try d.finalizeStruct(&result, info, &seen, first);
                         return result;
-                    } else return d.unexpected(first);
+                    } else return d.unexpected(first, null);
                 },
                 .lb => return d.deserializeDict(T, &result, info, &seen, first),
                 .dotlb => blk: {
                     const tok = d.next();
-                    if (tok.tag != .identifier) return d.unexpected(tok);
+                    if (tok.tag != .identifier) return d.unexpected(tok, null);
                     break :blk tok;
                 },
-                else => return d.unexpected(first),
+                else => return d.unexpected(first, null),
             };
             assert(field_token.tag == .identifier);
             outer: while (true) { // this is safe because we're filling `seen`
@@ -480,24 +492,24 @@ pub fn deserializeOne(d: *const Deserializer, T: type, first: Token, top_lvl: bo
                                 .lines = d.tokenizer.lines,
                                 .end = field_token.loc.end,
                             },
-                            else => return d.unexpected(field_token),
+                            else => return d.unexpected(field_token, "end of file"),
                         } else switch (field_token.tag) {
                             .rb => {},
-                            else => return d.unexpected(field_token),
+                            else => return d.unexpected(field_token, "\")\""),
                         }
 
                         // done parsing the struct, see if we have any missing field
                         try d.finalizeStruct(&result, info, &seen, field_token);
                         return result;
                     },
-                    else => return d.unexpected(field_token),
+                    else => return d.unexpected(field_token, null),
                 }
                 const name = field_token.loc.slice(d.src)[1..]; // skip '.'
                 inline for (info.fields, 0..) |f, idx| {
                     // We skip seen fields to optimize the happy path
                     if (!seen.isSet(idx) and std.mem.eql(u8, f.name, name)) {
                         const eql = d.next();
-                        if (eql.tag != .eql) return d.unexpected(eql);
+                        if (eql.tag != .eql) return d.unexpected(eql, "\"=\"");
 
                         if (@hasDecl(T, "ziggy_options") and
                             @hasDecl(T.ziggy_options, "skip_fields"))
@@ -562,7 +574,7 @@ pub fn deserializeOne(d: *const Deserializer, T: type, first: Token, top_lvl: bo
             .slice => switch (info.child) {
                 u8 => return d.parseBytes(T, first),
                 else => {
-                    if (first.tag != .lsb) return d.unexpected(first);
+                    if (first.tag != .lsb) return d.unexpected(first, "\"[\"");
 
                     var buf: std.ArrayList(info.child) = .empty;
                     errdefer buf.deinit(d.gpa);
@@ -583,7 +595,7 @@ pub fn deserializeOne(d: *const Deserializer, T: type, first: Token, top_lvl: bo
                                 continue;
                             },
                             .rsb => continue,
-                            else => return d.unexpected(first),
+                            else => return d.unexpected(first, "\",\" or \"]\""),
                         }
 
                         comptime unreachable;
@@ -638,7 +650,7 @@ inline fn deserializeDict(
                 try d.finalizeStruct(result, info, seen, field_token);
                 return result.*;
             },
-            else => return d.unexpected(field_token),
+            else => return d.unexpected(field_token, null),
         }
 
         const name = blk: {
@@ -650,7 +662,7 @@ inline fn deserializeDict(
             // We skip seen fields to optimize the happy path
             if (!seen.isSet(idx) and std.mem.eql(u8, f.name, name)) {
                 const colon = d.next();
-                if (colon.tag != .colon) return d.unexpected(colon);
+                if (colon.tag != .colon) return d.unexpected(colon, "\";\"");
                 if (@hasDecl(T, "ziggy_options") and
                     @hasDecl(T.ziggy_options, "deserializeField"))
                 {
